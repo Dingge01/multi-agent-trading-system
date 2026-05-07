@@ -102,16 +102,21 @@ def build_trading_graph(dry_run: bool = True) -> StateGraph:
     graph.add_node("execute", execution.run)
     graph.add_node("reject", reject_node)
 
-    # --- 并行 Fan-out ---
-    # START同时触发三个分析节点（LangGraph自动并行执行无依赖节点）
+    # --- 串行执行三个分析节点（避免并发请求yfinance被限流） ---
     graph.set_entry_point("fundamental")
-    graph.add_edge("__start__", "technical")
-    graph.add_edge("__start__", "sentiment")
+    graph.add_edge("fundamental", "technical")
+    graph.add_edge("technical", "sentiment")
 
-    # --- Fan-in ---
-    # 三个分析节点完成后，都汇入debate节点
-    graph.add_edge("fundamental", "debate")
-    graph.add_edge("technical", "debate")
+    # 添加流转标记（通过中间节点打印阶段分隔）
+    def _phase_transition(state: TradingState, phase: str) -> dict[str, Any]:
+        print(f"\n{'='*60}")
+        print(f"  [阶段流转] {phase}")
+        print(f"{'='*60}")
+        return {}
+
+    # 这里不需要额外节点，各 agent 内部已有详细输出
+
+    # --- 分析完成后汇入debate节点 ---
     graph.add_edge("sentiment", "debate")
 
     # --- 串行 Pipeline ---
@@ -149,6 +154,11 @@ def run_analysis(ticker: str, portfolio_value: float = 1_000_000,
     Returns:
         完整的决策结果状态
     """
+    print(f"\n{'#'*60}")
+    print(f"# 启动多Agent量化交易决策流程")
+    print(f"# 标的: {ticker} | 组合价值: ${portfolio_value:,.0f} | 模式: {'模拟' if dry_run else '实盘'}")
+    print(f"{'#'*60}\n")
+
     app = create_app(dry_run=dry_run)
 
     initial_state: TradingState = {
@@ -162,6 +172,10 @@ def run_analysis(ticker: str, portfolio_value: float = 1_000_000,
     }
 
     result = app.invoke(initial_state)
+
+    print(f"\n{'#'*60}")
+    print(f"# 流程结束 - 最终汇总")
+    print(f"{'#'*60}")
     return result
 
 

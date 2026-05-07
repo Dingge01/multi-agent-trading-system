@@ -12,16 +12,16 @@ Sentiment Agent - 情绪面分析Agent
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import yfinance as yf
-import requests
 from textblob import TextBlob
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from config.settings import CONFIG
+from config.settings import CONFIG, get_yf_session, parse_llm_json
 
 
 @dataclass
@@ -59,16 +59,22 @@ class SentimentAgent:
 }"""
 
     def __init__(self):
-        self.llm = ChatOpenAI(
+        kwargs = dict(
             model=CONFIG.llm.model,
             temperature=CONFIG.llm.temperature,
             api_key=CONFIG.llm.api_key,
         )
+        if CONFIG.llm.base_url:
+            kwargs["base_url"] = CONFIG.llm.base_url
+        self.llm = ChatOpenAI(**kwargs)
 
     def _analyze_news_sentiment(self, ticker: str) -> tuple[float, int]:
         """用yfinance获取新闻，TextBlob计算情绪极性均值"""
-        stock = yf.Ticker(ticker)
-        news = stock.news or []
+        try:
+            stock = yf.Ticker(ticker, session=get_yf_session())
+            news = stock.news or []
+        except Exception:
+            return 0.0, 0
 
         if not news:
             return 0.0, 0
@@ -84,7 +90,7 @@ class SentimentAgent:
         return round(avg_sentiment, 4), len(sentiments)
 
     def _get_institutional_info(self, ticker: str) -> str:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=get_yf_session())
         try:
             holders = stock.institutional_holders
             if holders is not None and not holders.empty:
@@ -94,7 +100,7 @@ class SentimentAgent:
             return "UNKNOWN"
 
     def _get_analyst_recommendation(self, ticker: str) -> str:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=get_yf_session())
         try:
             rec = stock.recommendations
             if rec is not None and not rec.empty:
@@ -105,9 +111,17 @@ class SentimentAgent:
             return "HOLD"
 
     def analyze(self, ticker: str) -> SentimentAnalysis:
+        print(f"    └─ 获取新闻情绪数据...")
         news_sentiment, news_count = self._analyze_news_sentiment(ticker)
+        print(f"       新闻情绪得分: {news_sentiment} (基于 {news_count} 条新闻)")
+
+        print(f"    └─ 获取机构持仓信息...")
         institutional = self._get_institutional_info(ticker)
+        print(f"       机构持仓状态: {institutional}")
+
+        print(f"    └─ 获取分析师评级...")
         analyst_rec = self._get_analyst_recommendation(ticker)
+        print(f"       分析师最新评级: {analyst_rec}")
 
         user_prompt = f"""请分析 {ticker} 的市场情绪：
 
@@ -116,15 +130,17 @@ class SentimentAgent:
 - 机构持仓状态: {institutional}
 - 分析师最新评级: {analyst_rec}"""
 
+        print(f"    └─ 调用 LLM 进行情绪面研判...")
         response = self.llm.invoke([
             SystemMessage(content=self.SYSTEM_PROMPT),
             HumanMessage(content=user_prompt),
         ])
+        print(f"    └─ LLM 原始返回:\n{response.content}")
 
-        try:
-            result = json.loads(response.content)
-        except json.JSONDecodeError:
-            result = {"score": 5.0, "signal": "HOLD", "reasoning": "LLM输出解析失败"}
+        result = parse_llm_json(
+            response.content,
+            default={"score": 5.0, "signal": "HOLD", "reasoning": "LLM输出解析失败"}
+        )
 
         return SentimentAnalysis(
             ticker=ticker,
@@ -139,8 +155,14 @@ class SentimentAgent:
 
     def run(self, state: dict[str, Any]) -> dict[str, Any]:
         """LangGraph节点入口"""
+        time.sleep(1)  # 延迟避免 yfinance 频率限制
         ticker = state["ticker"]
+        print(f"\n{'─'*50}")
+        print(f"  [Sentiment Agent] 开始分析 {ticker} 市场情绪...")
         analysis = self.analyze(ticker)
+        print(f"  [Sentiment Agent] 完成 → 评分: {analysis.score}/10 | 信号: {analysis.signal}")
+        print(f"    └─ 分析理由: {analysis.reasoning}")
+        print(f"{'─'*50}")
         return {
             "analyses": [{
                 "agent": "sentiment",

@@ -18,7 +18,7 @@ from typing import Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from config.settings import CONFIG
+from config.settings import CONFIG, parse_llm_json
 
 MAX_DEBATE_ROUNDS = 2
 
@@ -77,11 +77,14 @@ Bear方论点: {bear_args}
 }}"""
 
     def __init__(self):
-        self.llm = ChatOpenAI(
+        kwargs = dict(
             model=CONFIG.llm.model,
             temperature=0.5,
             api_key=CONFIG.llm.api_key,
         )
+        if CONFIG.llm.base_url:
+            kwargs["base_url"] = CONFIG.llm.base_url
+        self.llm = ChatOpenAI(**kwargs)
 
     def _format_analyses(self, analyses: list[dict]) -> str:
         lines = []
@@ -100,10 +103,10 @@ Bear方论点: {bear_args}
             SystemMessage(content=prompt),
             HumanMessage(content=f"分析数据:\n{data_summary}"),
         ])
-        try:
-            return json.loads(response.content)
-        except json.JSONDecodeError:
-            return {"arguments": ["数据整体偏正面"], "confidence": 0.5}
+        return parse_llm_json(
+            response.content,
+            default={"arguments": ["数据整体偏正面"], "confidence": 0.5}
+        )
 
     def _run_bear(self, data_summary: str, bull_rebuttal: str = "") -> dict:
         prev = f"\nBull方刚才的论点: {bull_rebuttal}\n请反驳并强化你的看空立场。" if bull_rebuttal else ""
@@ -113,10 +116,10 @@ Bear方论点: {bear_args}
             SystemMessage(content=prompt),
             HumanMessage(content=f"分析数据:\n{data_summary}"),
         ])
-        try:
-            return json.loads(response.content)
-        except json.JSONDecodeError:
-            return {"arguments": ["存在潜在风险"], "confidence": 0.5}
+        return parse_llm_json(
+            response.content,
+            default={"arguments": ["存在潜在风险"], "confidence": 0.5}
+        )
 
     def _run_judge(self, data_summary: str, bull_args: list[str], bear_args: list[str]) -> dict:
         prompt = self.JUDGE_PROMPT.format(
@@ -127,36 +130,61 @@ Bear方论点: {bear_args}
             SystemMessage(content=prompt),
             HumanMessage(content=f"原始分析数据:\n{data_summary}"),
         ])
-        try:
-            return json.loads(response.content)
-        except json.JSONDecodeError:
-            return {
+        return parse_llm_json(
+            response.content,
+            default={
                 "final_signal": "HOLD",
                 "confidence": 0.3,
                 "reasoning": "辩论结果解析失败，保守持有",
                 "recommended_action": "观望",
                 "target_position_pct": 0.0,
             }
+        )
 
     def debate(self, analyses: list[dict]) -> DebateResult:
         data_summary = self._format_analyses(analyses)
+        print(f"    └─ 综合输入分析数据:\n{data_summary}")
+
         all_bull_args = []
         all_bear_args = []
 
+        print(f"\n    ┌─ [辩论第 1 轮] Bull 方陈述")
         bull_result = self._run_bull(data_summary)
+        print(f"    │  Bull 信心: {bull_result.get('confidence', 0):.0%}")
+        for arg in bull_result.get("arguments", []):
+            print(f"    │  • {arg}")
         all_bull_args.extend(bull_result.get("arguments", []))
 
+        print(f"\n    ┌─ [辩论第 1 轮] Bear 方反驳")
         bear_result = self._run_bear(data_summary, str(all_bull_args))
+        print(f"    │  Bear 信心: {bear_result.get('confidence', 0):.0%}")
+        for arg in bear_result.get("arguments", []):
+            print(f"    │  • {arg}")
         all_bear_args.extend(bear_result.get("arguments", []))
 
-        for _ in range(MAX_DEBATE_ROUNDS - 1):
+        for round_idx in range(MAX_DEBATE_ROUNDS - 1):
+            r = round_idx + 2
+            print(f"\n    ┌─ [辩论第 {r} 轮] Bull 方再反驳")
             bull_result = self._run_bull(data_summary, str(all_bear_args))
+            print(f"    │  Bull 信心: {bull_result.get('confidence', 0):.0%}")
+            for arg in bull_result.get("arguments", []):
+                print(f"    │  • {arg}")
             all_bull_args.extend(bull_result.get("arguments", []))
 
+            print(f"\n    ┌─ [辩论第 {r} 轮] Bear 方再反驳")
             bear_result = self._run_bear(data_summary, str(all_bull_args))
+            print(f"    │  Bear 信心: {bear_result.get('confidence', 0):.0%}")
+            for arg in bear_result.get("arguments", []):
+                print(f"    │  • {arg}")
             all_bear_args.extend(bear_result.get("arguments", []))
 
+        print(f"\n    ┌─ [Judge 裁决]")
         judge_result = self._run_judge(data_summary, all_bull_args, all_bear_args)
+        print(f"    │  最终信号: {judge_result.get('final_signal', 'HOLD')}")
+        print(f"    │  置信度: {judge_result.get('confidence', 0):.0%}")
+        print(f"    │  建议操作: {judge_result.get('recommended_action', '观望')}")
+        print(f"    │  目标仓位: {judge_result.get('target_position_pct', 0):.1%}")
+        print(f"    │  裁决理由: {judge_result.get('reasoning', 'N/A')}")
 
         return DebateResult(
             bull_arguments=all_bull_args,
@@ -171,7 +199,12 @@ Bear方论点: {bear_args}
     def run(self, state: dict[str, Any]) -> dict[str, Any]:
         """LangGraph节点入口"""
         analyses = state.get("analyses", [])
+        print(f"\n{'═'*50}")
+        print(f"  [Debate Agent] 开始对 {len(analyses)} 份分析进行牛熊辩论...")
         result = self.debate(analyses)
+        print(f"\n  [Debate Agent] 完成 → 结论: {result.final_signal} (置信度: {result.confidence:.0%})")
+        print(f"    └─ 建议操作: {result.recommended_action} | 目标仓位: {result.target_position_pct:.1%}")
+        print(f"{'═'*50}")
         return {
             "debate_result": {
                 "bull_arguments": result.bull_arguments,

@@ -20,7 +20,7 @@ import yfinance as yf
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from config.settings import CONFIG
+from config.settings import CONFIG, parse_llm_json, get_yf_session
 
 
 @dataclass
@@ -70,23 +70,29 @@ class RiskAgent:
 }"""
 
     def __init__(self):
-        self.llm = ChatOpenAI(
+        kwargs = dict(
             model=CONFIG.llm.model,
             temperature=0.1,
             api_key=CONFIG.llm.api_key,
         )
+        if CONFIG.llm.base_url:
+            kwargs["base_url"] = CONFIG.llm.base_url
+        self.llm = ChatOpenAI(**kwargs)
         self.risk_config = CONFIG.risk
 
     def _calculate_var(self, ticker: str, confidence: float = 0.95, period: str = "1y") -> float:
         """历史模拟法VaR: 基于过去一年日收益率分布，计算95%置信度下的单日最大损失"""
-        stock = yf.Ticker(ticker)
-        df = stock.history(period=period)
-        if df.empty or len(df) < 30:
-            return 0.05
+        try:
+            stock = yf.Ticker(ticker, session=get_yf_session())
+            df = stock.history(period=period)
+            if df.empty or len(df) < 30:
+                return 0.05
 
-        daily_returns = df["Close"].pct_change().dropna()
-        var = np.percentile(daily_returns, (1 - confidence) * 100)
-        return abs(float(var))
+            daily_returns = df["Close"].pct_change().dropna()
+            var = np.percentile(daily_returns, (1 - confidence) * 100)
+            return abs(float(var))
+        except Exception:
+            return 0.05
 
     def _check_hard_rules(self, ticker: str, proposed_position: float,
                           portfolio_drawdown: float = 0.0) -> list[str]:
@@ -115,8 +121,23 @@ class RiskAgent:
         proposed_position = debate_result.get("target_position_pct", 0.0)
         portfolio_drawdown = (portfolio_state or {}).get("current_drawdown", 0.0)
 
+        print(f"    └─ 输入参数:")
+        print(f"       建议仓位: {proposed_position:.1%}")
+        print(f"       当前组合回撤: {portfolio_drawdown:.1%}")
+        print(f"       辩论结论: {debate_result.get('final_signal', 'HOLD')}")
+
+        print(f"    └─ 计算 VaR(95%)...")
         var_95 = self._calculate_var(ticker)
+        print(f"       VaR(95%): {var_95:.2%}")
+
+        print(f"    └─ 检查硬规则...")
         hard_violations = self._check_hard_rules(ticker, proposed_position, portfolio_drawdown)
+        if hard_violations:
+            print(f"       ⚠️ 硬规则违规:")
+            for v in hard_violations:
+                print(f"         • {v}")
+        else:
+            print(f"       ✅ 硬规则全部通过")
 
         if hard_violations:
             return RiskAssessment(
@@ -142,30 +163,46 @@ VaR(95%): {var_95:.2%}
 辩论理由: {debate_result.get('reasoning', '')}
 当前组合回撤: {portfolio_drawdown:.1%}"""
 
+        print(f"    └─ 调用 LLM 进行软规则风控评估...")
         response = self.llm.invoke([
             SystemMessage(content=self.SYSTEM_PROMPT),
             HumanMessage(content=user_prompt),
         ])
+        print(f"    └─ LLM 原始返回:\n{response.content}")
 
-        try:
-            result = json.loads(response.content)
-        except json.JSONDecodeError:
-            result = {
+        result = parse_llm_json(
+            response.content,
+            default={
                 "approved": False,
                 "adjusted_position_pct": 0.0,
                 "soft_warnings": ["LLM输出解析失败，保守否决"],
                 "reasoning": "解析失败，安全起见否决",
             }
+        )
 
         adjusted_pos = min(
             result.get("adjusted_position_pct", 0.0),
             self.risk_config.max_position_size,
         )
 
-        stock = yf.Ticker(ticker)
-        current_price = stock.info.get("currentPrice", stock.info.get("regularMarketPrice", 0))
+        try:
+            stock = yf.Ticker(ticker, session=get_yf_session())
+            current_price = stock.info.get("currentPrice", stock.info.get("regularMarketPrice", 0))
+        except Exception:
+            current_price = 0
         stop_loss = current_price * (1 - self.risk_config.stop_loss_pct) if current_price else 0
         take_profit = current_price * (1 + self.risk_config.take_profit_pct) if current_price else 0
+
+        print(f"    └─ 风控计算结果:")
+        print(f"       批准状态: {'通过' if result.get('approved', False) else '否决'}")
+        print(f"       调整后仓位: {adjusted_pos:.1%}")
+        print(f"       止损价: ${stop_loss:.2f}" if stop_loss else "       止损价: N/A")
+        print(f"       止盈价: ${take_profit:.2f}" if take_profit else "       止盈价: N/A")
+        soft_warnings = result.get("soft_warnings", [])
+        if soft_warnings:
+            print(f"       软警告:")
+            for w in soft_warnings:
+                print(f"         • {w}")
 
         return RiskAssessment(
             approved=result.get("approved", False),
@@ -186,7 +223,13 @@ VaR(95%): {var_95:.2%}
         debate_result = state.get("debate_result", {})
         portfolio_state = state.get("portfolio_state")
 
+        print(f"\n{'═'*50}")
+        print(f"  [Risk Agent] 开始对 {ticker} 进行风控审查...")
         assessment = self.assess(ticker, debate_result, portfolio_state)
+        status = "通过" if assessment.approved else "否决"
+        print(f"\n  [Risk Agent] 完成 → {status} (VaR: {assessment.var_95:.2%})")
+        print(f"    └─ 风控理由: {assessment.reasoning}")
+        print(f"{'═'*50}")
         return {
             "risk_assessment": {
                 "approved": assessment.approved,

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 from datetime import datetime
 
-from config.settings import CONFIG
+from config.settings import CONFIG, get_yf_session
 
 
 @dataclass
@@ -78,7 +78,15 @@ class ExecutionAgent:
     def execute(self, ticker: str, risk_assessment: dict,
                 debate_result: dict, portfolio_value: float = 1_000_000,
                 current_price: float = 0) -> ExecutionResult:
+        print(f"    └─ 输入参数:")
+        print(f"       标的: {ticker}")
+        print(f"       当前价格: ${current_price:.2f}" if current_price else "       当前价格: N/A")
+        print(f"       组合总值: ${portfolio_value:,.0f}")
+        print(f"       辩论信号: {debate_result.get('final_signal', 'HOLD')}")
+        print(f"       风控批准: {risk_assessment.get('approved', False)}")
+
         if not risk_assessment.get("approved", False):
+            print(f"    └─ ⚠️ 风控未批准，跳过执行")
             return ExecutionResult(
                 order_id="", ticker=ticker, side="none", quantity=0,
                 order_type="none", limit_price=None, status="REJECTED",
@@ -97,9 +105,14 @@ class ExecutionAgent:
 
         side = "buy" if signal == "BUY" else "sell"
         position_pct = risk_assessment.get("adjusted_position_pct", 0.0)
+        print(f"    └─ 计算下单量...")
+        print(f"       方向: {side.upper()}")
+        print(f"       建议仓位比例: {position_pct:.1%}")
         quantity = self._calculate_quantity(ticker, position_pct, portfolio_value, current_price)
+        print(f"       计算下单量: {quantity} 股")
 
         if quantity <= 0:
+            print(f"    └─ ⚠️ 下单量为0，不执行")
             return ExecutionResult(
                 order_id="", ticker=ticker, side=side, quantity=0,
                 order_type="none", limit_price=None, status="ZERO_QTY",
@@ -109,10 +122,17 @@ class ExecutionAgent:
 
         limit_price = self._calculate_limit_price(current_price, side)
         order_id = f"MAT-{uuid.uuid4().hex[:8]}"
+        print(f"    └─ 订单参数:")
+        print(f"       订单ID: {order_id}")
+        print(f"       限价: ${limit_price:.2f}")
+        print(f"       模式: {'模拟交易(Dry Run)' if self.dry_run else '实盘交易'}")
 
         if self.dry_run:
+            print(f"    └─ 执行模拟成交...")
             simulated_fill = current_price * (1.001 if side == "buy" else 0.999)
             slippage = abs(simulated_fill - current_price) / current_price
+            print(f"       模拟成交价: ${simulated_fill:.2f}")
+            print(f"       滑点: {slippage:.4%}")
             return ExecutionResult(
                 order_id=order_id, ticker=ticker, side=side, quantity=quantity,
                 order_type="limit", limit_price=limit_price,
@@ -157,9 +177,16 @@ class ExecutionAgent:
         debate_result = state.get("debate_result", {})
         portfolio_value = state.get("portfolio_value", 1_000_000)
 
+        print(f"\n{'═'*50}")
+        print(f"  [Execution Agent] 开始执行 {ticker} 交易...")
         import yfinance as yf
-        stock = yf.Ticker(ticker)
-        current_price = stock.info.get("currentPrice", stock.info.get("regularMarketPrice", 0))
+        try:
+            stock = yf.Ticker(ticker, session=get_yf_session())
+            current_price = stock.info.get("currentPrice", stock.info.get("regularMarketPrice", 0))
+            print(f"    └─ 获取当前价格: ${current_price:.2f}")
+        except Exception:
+            current_price = 0
+            print(f"    └─ ⚠️ 无法获取当前价格，设为 0")
 
         result = self.execute(
             ticker=ticker,
@@ -168,6 +195,9 @@ class ExecutionAgent:
             portfolio_value=portfolio_value,
             current_price=current_price,
         )
+        print(f"\n  [Execution Agent] 完成 → 状态: {result.status}")
+        print(f"    └─ 结果: {result.message}")
+        print(f"{'═'*50}")
         return {
             "execution_result": {
                 "order_id": result.order_id,

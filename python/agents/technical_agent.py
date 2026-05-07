@@ -12,6 +12,7 @@ Technical Agent - 技术面分析Agent
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,7 +22,7 @@ import pandas_ta as ta
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from config.settings import CONFIG
+from config.settings import CONFIG, get_yf_session, parse_llm_json
 
 
 @dataclass
@@ -67,58 +68,79 @@ class TechnicalAgent:
 }"""
 
     def __init__(self):
-        self.llm = ChatOpenAI(
+        kwargs = dict(
             model=CONFIG.llm.model,
             temperature=CONFIG.llm.temperature,
             api_key=CONFIG.llm.api_key,
         )
+        if CONFIG.llm.base_url:
+            kwargs["base_url"] = CONFIG.llm.base_url
+        self.llm = ChatOpenAI(**kwargs)
 
     def fetch_and_compute(self, ticker: str, period: str = "6mo") -> dict[str, Any]:
-        stock = yf.Ticker(ticker)
-        df = stock.history(period=period)
-        if df.empty:
+        try:
+            stock = yf.Ticker(ticker, session=get_yf_session())
+            df = stock.history(period=period)
+            if df.empty:
+                return {}
+
+            df.ta.macd(append=True)
+            df.ta.rsi(append=True)
+            df.ta.bbands(append=True)
+            df.ta.sma(length=20, append=True)
+            df.ta.sma(length=50, append=True)
+
+            latest = df.iloc[-1]
+            prev = df.iloc[-2] if len(df) > 1 else latest
+
+            vol_avg = df["Volume"].rolling(20).mean().iloc[-1]
+            vol_current = latest.get("Volume", 0)
+            if vol_current > vol_avg * 1.5:
+                volume_trend = "HIGH"
+            elif vol_current < vol_avg * 0.5:
+                volume_trend = "LOW"
+            else:
+                volume_trend = "NORMAL"
+
+            return {
+                "current_price": latest["Close"],
+                "macd": latest.get("MACD_12_26_9"),
+                "macd_signal": latest.get("MACDs_12_26_9"),
+                "macd_histogram": latest.get("MACDh_12_26_9"),
+                "rsi": latest.get("RSI_14"),
+                "bb_upper": latest.get("BBU_5_2.0"),
+                "bb_middle": latest.get("BBM_5_2.0"),
+                "bb_lower": latest.get("BBL_5_2.0"),
+                "sma_20": latest.get("SMA_20"),
+                "sma_50": latest.get("SMA_50"),
+                "volume_trend": volume_trend,
+                "price_change_5d": (latest["Close"] - df.iloc[-5]["Close"]) / df.iloc[-5]["Close"] if len(df) >= 5 else 0,
+            }
+        except Exception:
             return {}
-
-        df.ta.macd(append=True)
-        df.ta.rsi(append=True)
-        df.ta.bbands(append=True)
-        df.ta.sma(length=20, append=True)
-        df.ta.sma(length=50, append=True)
-
-        latest = df.iloc[-1]
-        prev = df.iloc[-2] if len(df) > 1 else latest
-
-        vol_avg = df["Volume"].rolling(20).mean().iloc[-1]
-        vol_current = latest.get("Volume", 0)
-        if vol_current > vol_avg * 1.5:
-            volume_trend = "HIGH"
-        elif vol_current < vol_avg * 0.5:
-            volume_trend = "LOW"
-        else:
-            volume_trend = "NORMAL"
-
-        return {
-            "current_price": latest["Close"],
-            "macd": latest.get("MACD_12_26_9"),
-            "macd_signal": latest.get("MACDs_12_26_9"),
-            "macd_histogram": latest.get("MACDh_12_26_9"),
-            "rsi": latest.get("RSI_14"),
-            "bb_upper": latest.get("BBU_5_2.0"),
-            "bb_middle": latest.get("BBM_5_2.0"),
-            "bb_lower": latest.get("BBL_5_2.0"),
-            "sma_20": latest.get("SMA_20"),
-            "sma_50": latest.get("SMA_50"),
-            "volume_trend": volume_trend,
-            "price_change_5d": (latest["Close"] - df.iloc[-5]["Close"]) / df.iloc[-5]["Close"] if len(df) >= 5 else 0,
-        }
 
     def analyze(self, ticker: str) -> TechnicalAnalysis:
         indicators = self.fetch_and_compute(ticker)
         if not indicators:
+            print(f"    └─ ⚠️ 无法获取技术指标数据")
             return TechnicalAnalysis(ticker=ticker, current_price=0, macd=None,
                                      macd_signal=None, macd_histogram=None, rsi=None,
                                      bb_upper=None, bb_middle=None, bb_lower=None,
                                      sma_20=None, sma_50=None)
+
+        print(f"    └─ 原始技术指标数据:")
+        print(f"       当前价格: ${indicators['current_price']:.2f}")
+        print(f"       MACD: {indicators.get('macd', 'N/A'):.4f}")
+        print(f"       MACD Signal: {indicators.get('macd_signal', 'N/A')}")
+        print(f"       MACD Histogram: {indicators.get('macd_histogram', 'N/A')}")
+        print(f"       RSI(14): {indicators.get('rsi', 'N/A')}")
+        print(f"       布林带上轨: {indicators.get('bb_upper', 'N/A')}")
+        print(f"       布林带中轨: {indicators.get('bb_middle', 'N/A')}")
+        print(f"       布林带下轨: {indicators.get('bb_lower', 'N/A')}")
+        print(f"       SMA(20): {indicators.get('sma_20', 'N/A')}")
+        print(f"       SMA(50): {indicators.get('sma_50', 'N/A')}")
+        print(f"       成交量趋势: {indicators.get('volume_trend', 'N/A')}")
+        print(f"       5日涨幅: {indicators.get('price_change_5d', 0):.2%}")
 
         user_prompt = f"""请分析 {ticker} 的技术指标（当前价格: ${indicators['current_price']:.2f}）：
 
@@ -134,15 +156,17 @@ class TechnicalAgent:
 - Volume Trend: {indicators.get('volume_trend', 'N/A')}
 - 5-Day Price Change: {indicators.get('price_change_5d', 0):.2%}"""
 
+        print(f"    └─ 调用 LLM 进行技术面研判...")
         response = self.llm.invoke([
             SystemMessage(content=self.SYSTEM_PROMPT),
             HumanMessage(content=user_prompt),
         ])
+        print(f"    └─ LLM 原始返回:\n{response.content}")
 
-        try:
-            result = json.loads(response.content)
-        except json.JSONDecodeError:
-            result = {"score": 5.0, "signal": "HOLD", "reasoning": "LLM输出解析失败"}
+        result = parse_llm_json(
+            response.content,
+            default={"score": 5.0, "signal": "HOLD", "reasoning": "LLM输出解析失败"}
+        )
 
         return TechnicalAnalysis(
             ticker=ticker,
@@ -164,8 +188,14 @@ class TechnicalAgent:
 
     def run(self, state: dict[str, Any]) -> dict[str, Any]:
         """LangGraph节点入口"""
+        time.sleep(1)  # 延迟避免 yfinance 频率限制
         ticker = state["ticker"]
+        print(f"\n{'─'*50}")
+        print(f"  [Technical Agent] 开始分析 {ticker} 技术面...")
         analysis = self.analyze(ticker)
+        print(f"  [Technical Agent] 完成 → 评分: {analysis.score}/10 | 信号: {analysis.signal}")
+        print(f"    └─ 分析理由: {analysis.reasoning}")
+        print(f"{'─'*50}")
         return {
             "analyses": [{
                 "agent": "technical",

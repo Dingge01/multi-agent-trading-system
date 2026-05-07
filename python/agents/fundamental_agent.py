@@ -11,6 +11,7 @@ Fundamental Agent - 基本面分析Agent
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,7 +19,7 @@ import yfinance as yf
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from config.settings import CONFIG
+from config.settings import CONFIG, get_yf_session, parse_llm_json
 
 
 @dataclass
@@ -62,30 +63,52 @@ class FundamentalAgent:
 }"""
 
     def __init__(self):
-        self.llm = ChatOpenAI(
+        kwargs = dict(
             model=CONFIG.llm.model,
             temperature=CONFIG.llm.temperature,
             api_key=CONFIG.llm.api_key,
         )
+        if CONFIG.llm.base_url:
+            kwargs["base_url"] = CONFIG.llm.base_url
+        self.llm = ChatOpenAI(**kwargs)
 
     def fetch_fundamentals(self, ticker: str) -> dict[str, Any]:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        return {
-            "pe_ratio": info.get("trailingPE"),
-            "pb_ratio": info.get("priceToBook"),
-            "roe": info.get("returnOnEquity"),
-            "revenue_growth": info.get("revenueGrowth"),
-            "profit_margin": info.get("profitMargins"),
-            "debt_to_equity": info.get("debtToEquity"),
-            "free_cash_flow": info.get("freeCashflow"),
-            "market_cap": info.get("marketCap"),
-            "sector": info.get("sector"),
-            "industry": info.get("industry"),
-        }
+        try:
+            stock = yf.Ticker(ticker, session=get_yf_session())
+            info = stock.info
+            return {
+                "pe_ratio": info.get("trailingPE"),
+                "pb_ratio": info.get("priceToBook"),
+                "roe": info.get("returnOnEquity"),
+                "revenue_growth": info.get("revenueGrowth"),
+                "profit_margin": info.get("profitMargins"),
+                "debt_to_equity": info.get("debtToEquity"),
+                "free_cash_flow": info.get("freeCashflow"),
+                "market_cap": info.get("marketCap"),
+                "sector": info.get("sector"),
+                "industry": info.get("industry"),
+            }
+        except Exception:
+            return {
+                "pe_ratio": None, "pb_ratio": None, "roe": None,
+                "revenue_growth": None, "profit_margin": None,
+                "debt_to_equity": None, "free_cash_flow": None,
+                "market_cap": None, "sector": None, "industry": None,
+            }
 
     def analyze(self, ticker: str) -> FundamentalAnalysis:
         fundamentals = self.fetch_fundamentals(ticker)
+
+        print(f"    └─ 原始财务数据:")
+        print(f"       PE Ratio: {fundamentals.get('pe_ratio', 'N/A')}")
+        print(f"       PB Ratio: {fundamentals.get('pb_ratio', 'N/A')}")
+        print(f"       ROE: {fundamentals.get('roe', 'N/A')}")
+        print(f"       Revenue Growth: {fundamentals.get('revenue_growth', 'N/A')}")
+        print(f"       Profit Margin: {fundamentals.get('profit_margin', 'N/A')}")
+        print(f"       Debt/Equity: {fundamentals.get('debt_to_equity', 'N/A')}")
+        print(f"       Free Cash Flow: {fundamentals.get('free_cash_flow', 'N/A')}")
+        print(f"       Market Cap: {fundamentals.get('market_cap', 'N/A')}")
+        print(f"       Sector: {fundamentals.get('sector', 'N/A')}")
 
         user_prompt = f"""请分析 {ticker} 的基本面数据：
 
@@ -99,15 +122,17 @@ class FundamentalAgent:
 - Market Cap: {fundamentals.get('market_cap', 'N/A')}
 - Sector: {fundamentals.get('sector', 'N/A')}"""
 
+        print(f"    └─ 调用 LLM 进行基本面研判...")
         response = self.llm.invoke([
             SystemMessage(content=self.SYSTEM_PROMPT),
             HumanMessage(content=user_prompt),
         ])
+        print(f"    └─ LLM 原始返回:\n{response.content}")
 
-        try:
-            result = json.loads(response.content)
-        except json.JSONDecodeError:
-            result = {"score": 5.0, "signal": "HOLD", "reasoning": "LLM输出解析失败，默认HOLD"}
+        result = parse_llm_json(
+            response.content,
+            default={"score": 5.0, "signal": "HOLD", "reasoning": "LLM输出解析失败，默认HOLD"}
+        )
 
         return FundamentalAnalysis(
             ticker=ticker,
@@ -125,8 +150,14 @@ class FundamentalAgent:
 
     def run(self, state: dict[str, Any]) -> dict[str, Any]:
         """LangGraph节点入口：接收state，返回分析结果写入state"""
+        time.sleep(1)  # 延迟避免 yfinance 频率限制
         ticker = state["ticker"]
+        print(f"\n{'─'*50}")
+        print(f"  [Fundamental Agent] 开始分析 {ticker} 基本面...")
         analysis = self.analyze(ticker)
+        print(f"  [Fundamental Agent] 完成 → 评分: {analysis.score}/10 | 信号: {analysis.signal}")
+        print(f"    └─ 分析理由: {analysis.reasoning}")
+        print(f"{'─'*50}")
         return {
             "analyses": [{
                 "agent": "fundamental",
